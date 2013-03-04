@@ -26,7 +26,8 @@
 -define(SEPARATOR, $\/).
 -define(MATCH_ALL, '*').
 
-%% @spec dispatch(Path::string(), DispatchList::[matchterm()]) ->
+%% @spec dispatch(Path::string(), DispatchList::[matchterm()],
+%%                wrq:reqdata()) ->
 %%                                            dispterm() | dispfail()
 %% @doc Interface for URL dispatching.
 %% See also http://bitbucket.org/justin/webmachine/wiki/DispatchConfiguration
@@ -34,7 +35,7 @@ dispatch(PathAsString, DispatchList, RD) ->
     dispatch([], PathAsString, DispatchList, RD).
 
 %% @spec dispatch(Host::string(), Path::string(),
-%%                DispatchList::[matchterm()]) ->
+%%                DispatchList::[matchterm()], wrq:reqdata()) ->
 %%         dispterm() | dispfail()
 %% @doc Interface for URL dispatching.
 %% See also http://bitbucket.org/justin/webmachine/wiki/DispatchConfiguration
@@ -47,23 +48,25 @@ dispatch(HostAsString, PathAsString, DispatchList, RD) ->
                      true -> 1;
                      _ -> 0
                  end,
-    {Host, Port} = split_host_port(HostAsString),
-    try_host_binding(DispatchList, lists:reverse(Host), Port,
-                     Path, ExtraDepth, RD).
+    {Host, Port} = split_host_port(HostAsString, wrq:scheme(RD)),
+    try_host_binding(DispatchList, Host, Port, Path, ExtraDepth, RD).
 
-split_host_port(HostAsString) ->
+split_host_port(HostAsString, Scheme) ->
     case string:tokens(HostAsString, ":") of
         [HostPart, PortPart] ->
             {split_host(HostPart), list_to_integer(PortPart)};
         [HostPart] ->
-            {split_host(HostPart), 80};
+            {split_host(HostPart), default_port(Scheme)};
         [] ->
             %% no host header
-            {[], 80}
+            {[], default_port(Scheme)}
     end.
 
 split_host(HostAsString) ->
     string:tokens(HostAsString, ".").
+
+default_port(http) -> 80;
+default_port(https) -> 443.
 
 %% @type matchterm() = hostmatchterm() | pathmatchterm().
 % The dispatch configuration is a list of these terms, and the
@@ -108,8 +111,8 @@ split_host(HostAsString) ->
 % Any atom pathterm other than '*' will match any token and will
 % create a binding in the result if a complete match occurs.
 
-%% @type guardfun() = function(wrq:reqdata()) -> boolean()
-%%                  | {Mod::atom(), Fun::atom()}
+%% @type guardfun() = (wrq:reqdata()) -> boolean()
+%%                  | {Mod::atom(), Fun::atom()}.
 % This function or tuple representing a function, if present, is
 % called after a successful match of the host, port, and path for a
 % dispatch entry. The function should take a single argument, the
@@ -147,9 +150,14 @@ split_host(HostAsString) ->
 
 %% @type dispfail() = {no_dispatch_match, pathtokens()}.
 
-try_host_binding([], Host, Port, Path, _Depth, _RD) ->
-    {no_dispatch_match, {Host, Port}, Path};
-try_host_binding([Dispatch|Rest], Host, Port, Path, Depth, RD) ->
+try_host_binding(Dispatch, Host, Port, Path, Depth, RD) ->
+    %% save work during each dispatch attempt by reversing Host up front
+    try_host_binding1(Dispatch, lists:reverse(Host), Port, Path, Depth, RD).
+
+try_host_binding1([], Host, Port, Path, _Depth, _RD) ->
+    %% Host was reversed inbound, correct it for result
+    {no_dispatch_match, {lists:reverse(Host), Port}, Path};
+try_host_binding1([Dispatch|Rest], Host, Port, Path, Depth, RD) ->
     {{HostSpec,PortSpec},PathSpec} =
         case Dispatch of
             {{H,P},S} -> {{H,P},S};
@@ -159,20 +167,22 @@ try_host_binding([Dispatch|Rest], Host, Port, Path, Depth, RD) ->
     case bind_port(PortSpec, Port, []) of
         {ok, PortBindings} ->
             case bind(lists:reverse(HostSpec), Host, PortBindings, 0) of
-                {ok, HostRemainder, HostBindings, _} ->
+                {ok, RevHostRemainder, HostBindings, _} ->
+                    %% Host was reversed inbound, correct it for remainder
+                    HostRemainder = lists:reverse(RevHostRemainder),
                     case try_path_binding(PathSpec, Path, HostRemainder, Port, HostBindings, Depth, RD) of
                         {Mod, Props, PathRemainder, PathBindings,
                          AppRoot, StringPath} ->
                             {Mod, Props, HostRemainder, Port, PathRemainder,
                              PathBindings, AppRoot, StringPath};
                         {no_dispatch_match, _} ->
-                            try_host_binding(Rest, Host, Port, Path, Depth, RD)
+                            try_host_binding1(Rest, Host, Port, Path, Depth, RD)
                     end;
                 fail ->
-                    try_host_binding(Rest, Host, Port, Path, Depth, RD)
+                    try_host_binding1(Rest, Host, Port, Path, Depth, RD)
             end;
         fail ->
-            try_host_binding(Rest, Host, Port, Path, Depth, RD)
+            try_host_binding1(Rest, Host, Port, Path, Depth, RD)
     end.
 
 bind_port(Port, Port, Bindings) -> {ok, Bindings};
@@ -197,8 +207,8 @@ try_path_binding([PathSpec|Rest], PathTokens, HostRemainder, Port, HostBindings,
             PathInfo = dict:from_list(NewBindings),
             RD1 =
                 case RD of
-                    testing ->
-                        testing;
+                    testing_ignore_dialyzer_warning_here ->
+                        testing_ignore_dialyzer_warning_here;
                     _ ->
                         wrq:load_dispatch_data(PathInfo, HostRemainder, Port, Remainder,
                                                AppRoot, StringPath, RD)
@@ -278,11 +288,17 @@ split_host_test() ->
     ?assertEqual(["foo","bar","baz"], split_host("foo.bar.baz")).
 
 split_host_port_test() ->
-    ?assertEqual({[], 80}, split_host_port("")),
+    ?assertEqual({[], 80}, split_host_port("", http)),
     ?assertEqual({["foo","bar","baz"], 80},
-                 split_host_port("foo.bar.baz:80")),
+                 split_host_port("foo.bar.baz:80", http)),
     ?assertEqual({["foo","bar","baz"], 1234},
-                 split_host_port("foo.bar.baz:1234")).
+                 split_host_port("foo.bar.baz:1234", http)),
+
+    ?assertEqual({[], 443}, split_host_port("", https)),
+    ?assertEqual({["foo","bar","baz"], 443},
+                 split_host_port("foo.bar.baz", https)),
+    ?assertEqual({["foo","bar","baz"], 1234},
+                 split_host_port("foo.bar.baz:1234", https)).
 
 %% port binding
 bind_port_simple_match_test() ->
@@ -343,7 +359,7 @@ bind_path_string_fail_test() ->
     ?assertEqual(fail, bind(["a","b"], ["a","c"], [], 0)).
 
 try_path_matching_test() ->
-    RD = testing,
+    RD = testing_ignore_dialyzer_warning_here,
     ?assertEqual({bar, baz, [], [], ".", ""},
                  try_path_binding([{["foo"], bar, baz}], ["foo"], [], 80, [], 0, RD)),
     Dispatch = [{["a", x], foo, bar},
@@ -359,14 +375,14 @@ try_path_matching_test() ->
                  try_path_binding(Dispatch, ["b","c","z","v"], [], 80, [], 0, RD)).
 
 try_path_failing_test() ->
-    RD = testing,
+    RD = testing_ignore_dialyzer_warning_here,
     ?assertEqual({no_dispatch_match, ["a"]},
                  try_path_binding([{["b"], x, y}], ["a"], [], 80, [], 0, RD)).
 
 %% host binding
 
 try_host_binding_nohosts_test() ->
-    RD = testing,
+    RD = testing_ignore_dialyzer_warning_here,
     PathDispatches = [{["a"], foo, bar},
                       {["b"], baz, quux}],
     ?assertEqual(try_host_binding([{{['*'],'*'},PathDispatches}],
@@ -387,7 +403,7 @@ try_host_binding_nohosts_test() ->
                                   ["quux","baz"], 1234, ["b"], 0, RD)).
 
 try_host_binding_noport_test() ->
-    RD = testing,
+    RD = testing_ignore_dialyzer_warning_here,
     Dispatch = [{["foo","bar"], [{["a"],x,y}]},
                 {["baz","quux"],[{["b"],z,q}]},
                 {[m,"quux"],    [{["c"],r,s}]},
@@ -411,20 +427,20 @@ try_host_binding_noport_test() ->
                                   ["quux","no"], 82, ["d"], 0, RD)).
 
 try_host_binding_fullmatch_test() ->
-    RD = testing,
+    RD = testing_ignore_dialyzer_warning_here,
     Dispatch = [{{["foo","bar"],80},[{["a"],x,y}]},
                 {{[foo,"bar"],80},  [{["b"],z,q}]},
                 {{[foo,"bar"],baz}, [{["c"],r,s}]},
                 {{['*',"bar"],'*'}, [{["d"],t,u}]}],
     ?assertEqual({x, y, [], 80, [], [], ".", ""},
                  try_host_binding(Dispatch,
-                                  ["bar","foo"], 80, ["a"], 0, RD)),
+                                  ["foo","bar"], 80, ["a"], 0, RD)),
     ?assertEqual({z, q, [], 80, [], [{foo,"baz"}], ".", ""},
                  try_host_binding(Dispatch,
-                                  ["bar","baz"], 80, ["b"], 0, RD)),
+                                  ["baz","bar"], 80, ["b"], 0, RD)),
     {Mod, Props, HostRemainder, Port, PathRemainder,
      PathBindings, AppRoot, StringPath}=
-        try_host_binding(Dispatch, ["bar","quux"], 1234, ["c"], 0, RD),
+        try_host_binding(Dispatch, ["quux","bar"], 1234, ["c"], 0, RD),
     ?assertEqual(r, Mod),
     ?assertEqual(s, Props),
     ?assertEqual("", HostRemainder),
@@ -435,16 +451,22 @@ try_host_binding_fullmatch_test() ->
     ?assertEqual(1234, proplists:get_value(baz, PathBindings)),
     ?assertEqual(".", AppRoot),
     ?assertEqual("", StringPath),
-    ?assertEqual({t, u, ["quux","foo"], 80, [], [], ".", ""},
-                 try_host_binding(Dispatch, ["bar","quux","foo"],80,["d"],0, RD)).
+    ?assertEqual({t, u, ["foo","quux"], 80, [], [], ".", ""},
+                 try_host_binding(Dispatch, ["foo","quux","bar"],80,["d"],0, RD)).
+
+try_host_binding_wildcard_token_order_test() ->
+    RD = wrq:create('GET', http, {1,1}, "testing", mochiweb_headers:from_list([])),
+    Dispatch = [{{['*',"quux","com"],80},[{['*'],x,y}]}],
+    ?assertEqual({x,y,["foo","bar","baz"],80,[],[],".",""},
+                 dispatch("foo.bar.baz.quux.com","/",Dispatch,RD)).
 
 try_host_binding_fail_test() ->
-    RD = testing,
+    RD = testing_ignore_dialyzer_warning_here,
     ?assertEqual({no_dispatch_match, {["bar","foo"], 1234}, ["x","y","z"]},
                  try_host_binding([], ["bar","foo"], 1234, ["x","y","z"], 0, RD)).
 
 dispatch_test() ->
-    RD = testing,
+    RD = wrq:create('GET', http, {1,1}, "testing", mochiweb_headers:from_list([])),
     TrueFun = fun(_) -> true end,
     FalseFun = fun(_) -> false end,
 
@@ -460,7 +482,7 @@ dispatch_test() ->
     ?assertEqual({x, y, [], 1234, [], [], "../../..", ""},
                  dispatch("foo.bar:1234", "a/b/",
                           [{{["foo","bar"],1234},[{["a","b"],x,y}]}], RD)),
-    ?assertEqual({no_dispatch_match, {["bar","baz"],8000}, ["q","r"]},
+    ?assertEqual({no_dispatch_match, {["baz","bar"],8000}, ["q","r"]},
                  dispatch("baz.bar:8000", "q/r",
                           [{{["foo","bar"],80},[{["a","b","c"],x,y}]}], RD)).
 

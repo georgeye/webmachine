@@ -20,12 +20,13 @@
 -export([method/1,scheme/1,version/1,peer/1,disp_path/1,path/1,raw_path/1,
          path_info/1,response_code/1,req_cookie/1,req_qs/1,req_headers/1,
          req_body/1,stream_req_body/2,resp_redirect/1,resp_headers/1,
-         resp_body/1,app_root/1,path_tokens/1, host_tokens/1, port/1]).
+         resp_body/1,app_root/1,path_tokens/1, host_tokens/1, port/1,
+         base_uri/1]).
 -export([path_info/2,get_req_header/2,do_redirect/2,fresh_resp_headers/2,
          get_resp_header/2,set_resp_header/3,set_resp_headers/2,
          set_disp_path/2,set_req_body/2,set_resp_body/2,set_response_code/2,
          merge_resp_headers/2,remove_resp_header/2,
-         append_to_resp_body/2,append_to_response_body/2,
+         append_to_resp_body/2,append_to_response_body/2, set_resp_range/2,
          max_recv_body/1,set_max_recv_body/2,
          get_cookie_value/2,get_qs_value/2,get_qs_value/3,set_peer/2,
          add_note/3, get_notes/1]).
@@ -55,6 +56,7 @@ create(Method,Scheme,Version,RawPath,Headers) ->
       disp_path=defined_in_load_dispatch_data,
       resp_redirect=false, resp_headers=mochiweb_headers:empty(),
       resp_body = <<>>, response_code=500,
+      resp_range = follow_request,
       notes=[]}).
 create(RD = #wm_reqdata{raw_path=RawPath}) ->
     {Path, _, _} = mochiweb_util:urlsplit_path(RawPath),
@@ -140,6 +142,7 @@ resp_headers(_RD = #wm_reqdata{resp_headers=RespH}) -> RespH. % mochiheaders
 
 resp_body(_RD = #wm_reqdata{resp_body=undefined}) -> undefined;
 resp_body(_RD = #wm_reqdata{resp_body={stream,X}}) -> {stream,X};
+resp_body(_RD = #wm_reqdata{resp_body={known_length_stream,X,Y}}) -> {known_length_stream,X,Y};
 resp_body(_RD = #wm_reqdata{resp_body={stream,X,Y}}) -> {stream,X,Y};
 resp_body(_RD = #wm_reqdata{resp_body={writer,X}}) -> {writer,X};
 resp_body(_RD = #wm_reqdata{resp_body=RespB}) when is_binary(RespB) -> RespB;
@@ -204,6 +207,13 @@ append_to_response_body(Data, RD=#wm_reqdata{resp_body=RespB}) ->
             append_to_response_body(iolist_to_binary(Data), RD)
     end.
 
+-spec set_resp_range(follow_request | ignore_request, #wm_reqdata{}) -> #wm_reqdata{}.
+%% follow_request : range responce for range request, normal responce for non-range one
+%% ignore_request : normal resopnse for either range reuqest or non-range one
+set_resp_range(RespRange, RD)
+  when RespRange =:= follow_request orelse RespRange =:= ignore_request ->
+    RD#wm_reqdata{resp_range = RespRange}.
+
 get_cookie_value(Key, RD) when is_list(Key) -> % string
     case lists:keyfind(Key, 1, req_cookie(RD)) of
         false -> undefined;
@@ -225,6 +235,27 @@ add_note(K, V, RD) -> RD#wm_reqdata{notes=[{K, V} | RD#wm_reqdata.notes]}.
 
 get_notes(RD) -> RD#wm_reqdata.notes.
 
+base_uri(RD) ->
+    Scheme = erlang:atom_to_list(RD#wm_reqdata.scheme),
+    Host = string:join(RD#wm_reqdata.host_tokens, "."),
+    PortString = port_string(RD#wm_reqdata.scheme, RD#wm_reqdata.port),
+    Scheme ++ "://" ++ Host ++ PortString.
+
+port_string(Scheme, Port) ->
+    case Scheme of
+        http ->
+            case Port of
+                80 -> "";
+                _ -> ":" ++ erlang:integer_to_list(Port)
+            end;
+        https ->
+            case Port of
+                443 -> "";
+                _ -> ":" ++ erlang:integer_to_list(Port)
+            end;
+        _ -> ":" ++ erlang:integer_to_list(Port)
+    end.
+
 %%
 %% Tests
 %%
@@ -233,7 +264,10 @@ get_notes(RD) -> RD#wm_reqdata.notes.
 -include_lib("eunit/include/eunit.hrl").
 
 make_wrq(Method, RawPath, Headers) ->
-    create(Method, {1,1}, RawPath, mochiweb_headers:from_list(Headers)).
+    make_wrq(Method, http, RawPath, Headers).
+
+make_wrq(Method, Scheme, RawPath, Headers) ->
+    create(Method, Scheme, {1,1}, RawPath, mochiweb_headers:from_list(Headers)).
 
 accessor_test() ->
     R0 = make_wrq('GET', "/foo?a=1&b=2", [{"Cookie", "foo=bar"}]),
@@ -248,7 +282,6 @@ accessor_test() ->
     ?assertEqual([{"foo", "bar"}], req_cookie(R)),
     ?assertEqual("bar", get_cookie_value("foo", R)),
     ?assertEqual("127.0.0.1", peer(R)).
-
     
 simple_dispatch_test() ->
     R0 = make_wrq('GET', "/foo?a=1&b=2", [{"Cookie", "foo=bar"}]),
@@ -264,6 +297,39 @@ simple_dispatch_test() ->
                            StringPath,
                            R1),
     ?assertEqual(".", app_root(R)),
-    ?assertEqual(80, port(R)).
+    ?assertEqual(80, port(R)),
+    ?assertEqual("http://127.0.0.1", base_uri(R)).
+
+base_uri_test_() ->
+    Make_req =
+        fun(Scheme, Host) ->
+                R0 = make_wrq('GET', Scheme, "/foo?a=1&b=2",
+                              [{"Cookie", "foo=bar"}]),
+                R1 = set_peer("127.0.0.1", R0),
+                DispatchRule = {["foo"], foo_resource, []},
+                {_, _, HostTokens, Port, PathTokens,
+                 Bindings, AppRoot,StringPath} =
+                    webmachine_dispatcher:dispatch(Host, "/foo", [DispatchRule],
+                                                   R1),
+                load_dispatch_data(Bindings,
+                                   HostTokens,
+                                   Port,
+                                   PathTokens,
+                                   AppRoot,
+                                   StringPath,
+                                   R1)
+        end,
+    Tests = [{{http, "somewhere.com:8080"}, "http://somewhere.com:8080"},
+             {{https, "somewhere.com:8080"}, "https://somewhere.com:8080"},
+
+             {{http, "somewhere.com"}, "http://somewhere.com"},
+             {{https, "somewhere.com"}, "https://somewhere.com"},
+
+             {{http, "somewhere.com:80"}, "http://somewhere.com"},
+             {{https, "somewhere.com:443"}, "https://somewhere.com"},
+             {{https, "somewhere.com:80"}, "https://somewhere.com:80"},
+             {{http, "somewhere.com:443"}, "http://somewhere.com:443"}],
+    [ ?_assertEqual(Expect, base_uri(Make_req(Scheme, Host)))
+      || {{Scheme, Host}, Expect} <- Tests ].
 
 -endif.
